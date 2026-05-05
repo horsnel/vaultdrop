@@ -1,0 +1,21 @@
+name = "vaultdrop-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+API_BASE = "https://vaultdrop-scraper-production.up.railway.app"
+
+# KV namespace for caching scraped data
+[[kv_namespaces]]
+binding = "VAULTDROP_KV"
+id = "VAULTDROP_KV_ID"
+preview_id = "VAULTDROP_KV_PREVIEW_ID"
+
+# Cron triggers for scheduled scraping
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Routes
+routes = [
+  { pattern = "api.vaultdrop.pages.dev/*", zone_name = "vaultdrop.pages.dev" }
+]

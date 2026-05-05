@@ -1,0 +1,19 @@
+name: Frontend Backup Scraper
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Trigger Railway scrapers
+        run: |
+          for scraper in codm pubgm freefire bloodstrike apk_monitor advance_server_tracker meme_scraper; do
+            curl -X POST "https://vaultdrop-scraper-production.up.railway.app/scraper/trigger/$scraper" || true
+          done
+          echo "All scrapers triggered"
