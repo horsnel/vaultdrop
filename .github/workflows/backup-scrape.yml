@@ -13,5 +13,5 @@ jobs:
     steps:
       - name: Trigger Cloudflare Worker scrape
         run: |
-          curl -X POST "https://api.vaultdrop.pages.dev/scraper/trigger" || true
+          curl -X POST "https://vaultdrop-worker.odehebuka48.workers.dev/scraper/trigger" || true
           echo "Scrape triggered on Cloudflare Worker"

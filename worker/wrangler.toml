@@ -14,7 +14,5 @@ DATA_BRANCH = "data"
 [triggers]
 crons = ["*/15 * * * *"]
 
-# Routes — serves the API at api.vaultdrop.pages.dev
-routes = [
-  { pattern = "api.vaultdrop.pages.dev/*", zone_name = "vaultdrop.pages.dev" }
-]
+# Custom domain can be added later via Cloudflare dashboard
+# Dashboard > Workers > vaultdrop-worker > Settings > Triggers > Custom Domains

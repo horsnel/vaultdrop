@@ -10,7 +10,7 @@ import {
 } from './types';
 
 // Cloudflare Worker API (replaces Railway)
-const API_BASE = 'https://api.vaultdrop.pages.dev';
+const API_BASE = 'https://vaultdrop-worker.odehebuka48.workers.dev';
 
 async function fetchAPI<T>(endpoint: string, params?: Record<string, string>): Promise<T> {
   const url = new URL(endpoint, API_BASE);
