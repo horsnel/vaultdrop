@@ -1,4 +1,4 @@
-name: Frontend Backup Scraper
+name: Trigger Scrape
 
 on:
   schedule:
@@ -11,9 +11,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Trigger Railway scrapers
+      - name: Trigger Cloudflare Worker scrape
         run: |
-          for scraper in codm pubgm freefire bloodstrike apk_monitor advance_server_tracker meme_scraper; do
-            curl -X POST "https://vaultdrop-scraper-production.up.railway.app/scraper/trigger/$scraper" || true
-          done
-          echo "All scrapers triggered"
+          curl -X POST "https://api.vaultdrop.pages.dev/scraper/trigger" || true
+          echo "Scrape triggered on Cloudflare Worker"

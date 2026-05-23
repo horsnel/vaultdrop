@@ -36,3 +36,6 @@ next-env.d.ts
 # worker
 worker/node_modules/
 worker/dist/
+
+# Secrets
+.env.secrets

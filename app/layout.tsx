@@ -26,11 +26,7 @@ export default function RootLayout({
               © {new Date().getFullYear()} VaultDrop — First-Mover Gaming Intelligence
             </p>
             <div className="flex items-center gap-4 text-sm text-slate-500">
-              <a href="https://vaultdrop-14u.pages.dev/" target="_blank" rel="noopener noreferrer" className="hover:text-neon-purple transition-colors">
-                Cloudflare Pages
-              </a>
-              <span>•</span>
-              <span>Powered by VaultDrop API</span>
+              <span>Powered by Cloudflare Workers</span>
             </div>
           </div>
         </footer>

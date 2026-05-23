@@ -3,7 +3,8 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
-API_BASE = "https://vaultdrop-scraper-production.up.railway.app"
+# No longer proxies to Railway — the Worker IS the API
+API_BASE = ""
 
 # KV namespace for caching scraped data
 [[kv_namespaces]]
@@ -15,7 +16,7 @@ preview_id = "VAULTDROP_KV_PREVIEW_ID"
 [triggers]
 crons = ["*/15 * * * *"]
 
-# Routes
+# Routes — serves the API at api.vaultdrop.pages.dev
 routes = [
   { pattern = "api.vaultdrop.pages.dev/*", zone_name = "vaultdrop.pages.dev" }
 ]

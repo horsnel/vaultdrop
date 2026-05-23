@@ -1,75 +1,167 @@
 /**
- * VaultDrop CloudFlare Worker — Backup Scraper & API Cache
+ * VaultDrop CloudFlare Worker — Primary API & Scraper
  *
  * This worker serves as:
- * 1. A backup scraper that runs on Cron triggers (every 15 minutes)
- * 2. A caching layer for the Railway API
- * 3. A fallback API when Railway is down
+ * 1. The primary API for the VaultDrop frontend (replaces Railway)
+ * 2. A caching layer using Cloudflare KV
+ * 3. A scheduled scraper that runs every 15 minutes via Cron
  *
- * Scrapers implemented:
- * - APK Version Monitor (APKMirror + APKPure for all 4 games)
- * - Reddit leak scraper (all game subreddits)
+ * API Endpoints:
+ * - GET /health              — Health check
+ * - GET /leaks               — Paginated leaks (supports ?game=&category=&limit=&offset=)
+ * - GET /leaks/categories    — Leak categories with counts
+ * - GET /clips               — Paginated clips (supports ?game=&limit=&offset=)
+ * - GET /memes               — Paginated memes (supports ?game=&limit=&offset=)
+ * - GET /apk/alerts          — APK version alerts (supports ?game=)
+ * - GET /advance-servers     — Advance server status (supports ?game=)
+ * - GET /taptap              — TapTap posts (supports ?game=)
+ * - GET /stats               — Content statistics
+ * - GET /content             — General content query (supports ?type=&game=)
+ * - POST /scraper/trigger    — Manually trigger a scrape run
+ *
+ * Scrapers:
+ * - Reddit leak scraper (game-specific subreddits + cross-game)
+ * - APK Version Monitor (APKMirror for all 4 games)
  * - Advance server status checker
- * - Cross-game r/GamingLeaksAndRumours monitor
  */
 
 export interface Env {
   VAULTDROP_KV: KVNamespace;
-  API_BASE: string;
+  API_BASE: string; // kept for future use but no longer proxies to Railway
 }
 
 // ---- Types ----
-interface ScrapedItem {
-  type: 'leak' | 'apk_version' | 'advance_server';
+
+interface Leak {
+  id: number;
   game: string;
   title: string;
-  description?: string;
-  category?: string;
-  source_url?: string;
-  source_name?: string;
-  thumbnail_url?: string;
-  severity?: string;
-  raw_data?: Record<string, unknown>;
+  description: string;
+  category: string;
+  source_url: string;
+  source_name: string;
+  thumbnail_url: string;
+  media_url: string;
+  ai_caption: string;
+  severity: string;
+  is_verified: boolean;
+  created_at: string;
 }
 
-// ---- APK Monitor ----
-const APKMIRROR_APPS: Record<string, { url: string; package: string; name: string }> = {
-  codm: {
+interface Clip {
+  id: number;
+  game: string;
+  title: string;
+  description: string;
+  category: string;
+  source_url: string;
+  thumbnail_url: string;
+  views: number;
+  likes: number;
+  created_at: string;
+}
+
+interface Meme {
+  id: number;
+  game: string;
+  title: string;
+  image_url: string;
+  source_url: string;
+  source_name: string;
+  upvotes: number;
+}
+
+interface APKVersion {
+  id: number;
+  game: string;
+  package_name: string;
+  version_name: string;
+  version_code: number;
+  source: string;
+  source_url: string;
+  is_beta: boolean;
+  detected_at: string;
+}
+
+interface AdvanceServer {
+  id: number;
+  game: string;
+  server_name: string;
+  status: string;
+  registration_url: string;
+  source_url: string;
+  notes: string;
+  detected_at: string;
+}
+
+interface TaptapPost {
+  id: number;
+  game: string;
+  title: string;
+  original_title: string;
+  content: string;
+  language: string;
+  source_url: string;
+  author: string;
+  likes: number;
+}
+
+interface LeakCategory {
+  category: string;
+  count: number;
+}
+
+interface ContentStats {
+  leaks: number;
+  clips: number;
+  memes: number;
+  apk_versions: number;
+  advance_servers: number;
+  taptap_posts: number;
+  scraper_runs: number;
+  by_game: { game: string; count: number }[];
+  by_category: { category: string; count: number }[];
+}
+
+// ---- Scraping Config ----
+
+const APKMIRROR_APPS: Record<string, { url: string; pkg: string; name: string }> = {
+  CODM: {
     url: 'https://www.apkmirror.com/apk/activision-publishing-inc/call-of-duty-mobile/',
-    package: 'com.activision.callofduty.shooter',
+    pkg: 'com.activision.callofduty.shooter',
     name: 'Call of Duty: Mobile',
   },
-  pubgm: {
+  PUBGM: {
     url: 'https://www.apkmirror.com/apk/proxima-beta/pubg-mobile-arcade-shooting/',
-    package: 'com.tencent.ig',
+    pkg: 'com.tencent.ig',
     name: 'PUBG Mobile',
   },
-  freefire: {
+  'Free Fire': {
     url: 'https://www.apkmirror.com/apk/garena-online-private/garena-free-fire/',
-    package: 'com.dts.freefireth',
+    pkg: 'com.dts.freefireth',
     name: 'Free Fire',
   },
-  bloodstrike: {
+  'Blood Strike': {
     url: 'https://www.apkmirror.com/apk/netease-games/blood-strike/',
-    package: 'com.netease.bs',
+    pkg: 'com.netease.bs',
     name: 'Blood Strike',
   },
 };
 
 const REDDIT_SOURCES: Record<string, string[]> = {
-  codm: [
+  CODM: [
     'https://www.reddit.com/r/CODMobileLeaks/new.json?limit=10',
     'https://www.reddit.com/r/CallOfDutyMobile/new.json?limit=10',
   ],
-  pubgm: [
+  PUBGM: [
     'https://www.reddit.com/r/PUBGMobileLeaks/new.json?limit=10',
     'https://www.reddit.com/r/BGMI/new.json?limit=10',
   ],
-  freefire: [
+  'Free Fire': [
     'https://www.reddit.com/r/FreeFireLeaks/new.json?limit=10',
     'https://www.reddit.com/r/freefire/new.json?limit=10',
   ],
-  bloodstrike: [
+  'Blood Strike': [
     'https://www.reddit.com/r/BloodStrike/new.json?limit=10',
   ],
 };
@@ -78,7 +170,16 @@ const CROSS_GAME_REDDIT = [
   'https://www.reddit.com/r/GamingLeaksAndRumours/search.json?q=codm+OR+pubgm+OR+free+fire+OR+blood+strike&sort=new&limit=10',
 ];
 
+// Advance server check URLs (official & community sources)
+const ADVANCE_SERVER_SOURCES: Record<string, { url: string; name: string }> = {
+  CODM: { url: 'https://www.callofduty.com/mobile/test', name: 'CODM Test Server' },
+  PUBGM: { url: 'https://www.pubgmobile.com/news', name: 'PUBGM Beta Server' },
+  'Free Fire': { url: 'https://ff.advance.garena.com/', name: 'FF Advance Server' },
+  'Blood Strike': { url: 'https://bloodstrike.netease.com/', name: 'Blood Strike Beta' },
+};
+
 // ---- Category Classification ----
+
 const CATEGORY_KEYWORDS: Record<string, string[]> = {
   mythic: ['mythic', 'mythic draw', 'mythic weapon'],
   legendary: ['legendary', 'legendary draw', 'legendary skin'],
@@ -105,16 +206,36 @@ function classifyCategory(text: string): string {
   return best;
 }
 
+// ---- KV Helpers ----
+
+async function getCached<T>(env: Env, key: string): Promise<T | null> {
+  try {
+    const raw = await env.VAULTDROP_KV.get(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setCached(env: Env, key: string, value: unknown, ttl = 900): Promise<void> {
+  try {
+    await env.VAULTDROP_KV.put(key, JSON.stringify(value), { expirationTtl: ttl });
+  } catch (e) {
+    console.error(`[Worker] KV write error for ${key}:`, e);
+  }
+}
+
 // ---- Scraping Functions ----
 
-async function scrapeReddit(gameKey: string, urls: string[]): Promise<ScrapedItem[]> {
-  const items: ScrapedItem[] = [];
+async function scrapeReddit(gameKey: string, urls: string[]): Promise<Leak[]> {
+  const items: Leak[] = [];
+  let idCounter = Date.now();
 
   for (const url of urls) {
     try {
       const resp = await fetch(url, {
         headers: {
-          'User-Agent': 'VaultDrop/1.0 (Content Aggregator)',
+          'User-Agent': 'VaultDrop/2.0 (Content Aggregator)',
           'Accept': 'application/json',
         },
       });
@@ -132,9 +253,13 @@ async function scrapeReddit(gameKey: string, urls: string[]): Promise<ScrapedIte
         const flair = post.link_flair_text || '';
         const category = classifyCategory(title + ' ' + flair);
         const thumbnail = post.thumbnail?.startsWith('http') ? post.thumbnail : '';
+        const hasMedia = post.is_video || (post.preview?.images?.length > 0);
+        const mediaUrl = hasMedia
+          ? (post.url?.startsWith('http') && !post.url.includes('reddit.com') ? post.url : '')
+          : '';
 
         items.push({
-          type: 'leak',
+          id: idCounter++,
           game: gameKey,
           title,
           description: (post.selftext || '').slice(0, 500),
@@ -142,16 +267,13 @@ async function scrapeReddit(gameKey: string, urls: string[]): Promise<ScrapedIte
           source_url: `https://reddit.com${post.permalink || ''}`,
           source_name: `r/${post.subreddit || 'unknown'}`,
           thumbnail_url: thumbnail,
+          media_url: mediaUrl,
+          ai_caption: '',
           severity: ['mythic', 'legendary', 'leak', 'datamine', 'beta'].some(kw =>
             title.toLowerCase().includes(kw)
           ) ? 'high' : 'normal',
-          raw_data: {
-            score: post.score || 0,
-            num_comments: post.num_comments || 0,
-            author: post.author || '',
-            created_utc: post.created_utc || 0,
-            source: 'cloudflare_worker',
-          },
+          is_verified: (post.score || 0) > 50,
+          created_at: new Date((post.created_utc || 0) * 1000).toISOString(),
         });
       }
     } catch (e) {
@@ -162,14 +284,15 @@ async function scrapeReddit(gameKey: string, urls: string[]): Promise<ScrapedIte
   return items;
 }
 
-async function scrapeAPKVersions(): Promise<ScrapedItem[]> {
-  const items: ScrapedItem[] = [];
+async function scrapeAPKVersions(): Promise<APKVersion[]> {
+  const items: APKVersion[] = [];
+  let idCounter = Date.now() + 100000;
 
   for (const [gameKey, appInfo] of Object.entries(APKMIRROR_APPS)) {
     try {
       const resp = await fetch(appInfo.url, {
         headers: {
-          'User-Agent': 'VaultDrop/1.0 (Content Aggregator)',
+          'User-Agent': 'VaultDrop/2.0 (Content Aggregator)',
         },
       });
 
@@ -188,44 +311,21 @@ async function scrapeAPKVersions(): Promise<ScrapedItem[]> {
         }
       }
 
-      // Check against cached versions
-      const cachedKey = `apk_versions:${gameKey}`;
-      const cachedVersions = await VAULTDROP_KV_GET(cachedKey);
-      const knownVersions = cachedVersions ? JSON.parse(cachedVersions) : [];
-
       for (const version of versions) {
-        const isNew = !knownVersions.includes(version);
         const isBeta = /beta|test|rc|alpha/i.test(version);
 
         items.push({
-          type: 'apk_version',
+          id: idCounter++,
           game: gameKey,
-          title: isNew
-            ? `NEW: ${appInfo.name} APK v${version} detected!`
-            : `${appInfo.name} APK v${version}`,
-          description: `Version ${version} on APKMirror${isNew ? ' — NEW VERSION!' : ''}`,
-          category: 'apk_update',
+          package_name: appInfo.pkg,
+          version_name: version,
+          version_code: parseInt(version.replace(/\./g, ''), 10) || 0,
+          source: 'APKMirror',
           source_url: appInfo.url,
-          source_name: 'APKMirror',
-          severity: isNew ? 'high' : 'normal',
-          raw_data: {
-            package_name: appInfo.package,
-            version_name: version,
-            is_new: isNew,
-            is_beta: isBeta,
-            source: 'apkmirror',
-            source: 'cloudflare_worker',
-          },
+          is_beta: isBeta,
+          detected_at: new Date().toISOString(),
         });
-
-        // Update cache with new versions
-        if (isNew) {
-          knownVersions.push(version);
-        }
       }
-
-      // Save updated cache
-      await VAULTDROP_KV_PUT(cachedKey, JSON.stringify(knownVersions));
     } catch (e) {
       console.error(`[Worker] APK scrape error for ${gameKey}:`, e);
     }
@@ -234,154 +334,360 @@ async function scrapeAPKVersions(): Promise<ScrapedItem[]> {
   return items;
 }
 
-// KV helper wrappers (for type safety with Env)
-async function VAULTDROP_KV_GET(key: string): Promise<string | null> {
-  // This will be called with proper binding
-  return null; // Placeholder — actual implementation uses env
-}
+async function scrapeAdvanceServers(): Promise<AdvanceServer[]> {
+  const items: AdvanceServer[] = [];
+  let idCounter = Date.now() + 200000;
 
-async function VAULTDROP_KV_PUT(key: string, value: string): Promise<void> {
-  // Placeholder — actual implementation uses env
-}
+  for (const [gameKey, source] of Object.entries(ADVANCE_SERVER_SOURCES)) {
+    try {
+      const resp = await fetch(source.url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': 'VaultDrop/2.0 (Content Aggregator)' },
+        redirect: 'follow',
+      });
 
-// ---- Push to Railway API ----
+      // If the URL responds, we assume the server page is available
+      const isOpen = resp.ok || resp.status === 200 || resp.status === 301 || resp.status === 302;
 
-async function pushToRailwayAPI(env: Env, items: ScrapedItem[]): Promise<number> {
-  if (!items.length) return 0;
-
-  try {
-    // Push items to the Railway backend's /scraper/trigger endpoint
-    // The Railway backend handles actual DB storage
-    // The worker just triggers scrapers and caches results
-    const resp = await fetch(`${env.API_BASE}/stats`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-    });
-
-    if (resp.ok) {
-      console.log(`[Worker] Railway API is alive, ${items.length} items scraped`);
+      items.push({
+        id: idCounter++,
+        game: gameKey,
+        server_name: source.name,
+        status: isOpen ? 'rumored' : 'closed',
+        registration_url: source.url,
+        source_url: source.url,
+        notes: isOpen
+          ? 'Server page accessible — check for registration openings'
+          : 'Server page currently unavailable',
+        detected_at: new Date().toISOString(),
+      });
+    } catch {
+      items.push({
+        id: idCounter++,
+        game: gameKey,
+        server_name: source.name,
+        status: 'unknown',
+        registration_url: source.url,
+        source_url: source.url,
+        notes: 'Could not verify server status',
+        detected_at: new Date().toISOString(),
+      });
     }
-
-    // Cache items in KV for fallback serving
-    const cacheKey = `scraped:${Date.now()}`;
-    await env.VAULTDROP_KV.put(cacheKey, JSON.stringify(items), { expirationTtl: 3600 });
-
-    // Update the latest items cache
-    await env.VAULTDROP_KV.put('latest_items', JSON.stringify(items.slice(0, 50)), { expirationTtl: 900 });
-
-    return items.length;
-  } catch (e) {
-    console.error('[Worker] Error pushing to Railway:', e);
-    // Still cache locally even if Railway is down
-    const cacheKey = `scraped:${Date.now()}`;
-    await env.VAULTDROP_KV.put(cacheKey, JSON.stringify(items), { expirationTtl: 3600 });
-    await env.VAULTDROP_KV.put('latest_items', JSON.stringify(items.slice(0, 50)), { expirationTtl: 900 });
-    return items.length;
   }
+
+  return items;
 }
 
-// ---- Main Worker ----
+async function generateClipsFromLeaks(leaks: Leak[]): Promise<Clip[]> {
+  // Generate clips from Reddit video posts
+  return leaks
+    .filter(l => l.media_url && (l.media_url.includes('v.redd.it') || l.media_url.includes('youtu')))
+    .map((l, i) => ({
+      id: l.id + 300000,
+      game: l.game,
+      title: l.title,
+      description: l.description,
+      category: l.category,
+      source_url: l.source_url,
+      thumbnail_url: l.thumbnail_url,
+      views: 0,
+      likes: 0,
+      created_at: l.created_at,
+    }));
+}
+
+async function generateMemesFromLeaks(leaks: Leak[]): Promise<Meme[]> {
+  // Generate memes from Reddit image posts
+  return leaks
+    .filter(l => l.thumbnail_url && !l.media_url)
+    .map((l) => ({
+      id: l.id + 400000,
+      game: l.game,
+      title: l.title,
+      image_url: l.thumbnail_url,
+      source_url: l.source_url,
+      source_name: l.source_name,
+      upvotes: 0,
+    }));
+}
+
+// ---- Full Scrape Run ----
+
+async function runFullScrape(env: Env): Promise<void> {
+  console.log('[Worker] Starting full scrape...');
+
+  const allLeaks: Leak[] = [];
+  const allClips: Clip[] = [];
+  const allMemes: Meme[] = [];
+
+  // 1. Scrape Reddit for all games
+  for (const [gameKey, urls] of Object.entries(REDDIT_SOURCES)) {
+    const leaks = await scrapeReddit(gameKey, urls);
+    allLeaks.push(...leaks);
+  }
+
+  // 2. Scrape cross-game subreddits
+  for (const url of CROSS_GAME_REDDIT) {
+    const leaks = await scrapeReddit('CODM', [url]); // default to CODM for cross-game
+    allLeaks.push(...leaks);
+  }
+
+  // 3. Scrape APK versions
+  const apkVersions = await scrapeAPKVersions();
+
+  // 4. Scrape advance servers
+  const advanceServers = await scrapeAdvanceServers();
+
+  // 5. Derive clips & memes from leaks
+  const clips = await generateClipsFromLeaks(allLeaks);
+  const memes = await generateMemesFromLeaks(allLeaks);
+
+  // 6. Compute categories
+  const categoryMap: Record<string, number> = {};
+  for (const leak of allLeaks) {
+    categoryMap[leak.category] = (categoryMap[leak.category] || 0) + 1;
+  }
+  const categories: LeakCategory[] = Object.entries(categoryMap).map(([category, count]) => ({
+    category,
+    count,
+  }));
+
+  // 7. Compute stats
+  const gameCountMap: Record<string, number> = {};
+  for (const leak of allLeaks) {
+    gameCountMap[leak.game] = (gameCountMap[leak.game] || 0) + 1;
+  }
+
+  const stats: ContentStats = {
+    leaks: allLeaks.length,
+    clips: clips.length,
+    memes: memes.length,
+    apk_versions: apkVersions.length,
+    advance_servers: advanceServers.length,
+    taptap_posts: 0,
+    scraper_runs: 0,
+    by_game: Object.entries(gameCountMap).map(([game, count]) => ({ game, count })),
+    by_category: categories,
+  };
+
+  // 8. Cache everything in KV (15 min TTL)
+  await Promise.all([
+    setCached(env, 'leaks:all', allLeaks, 900),
+    setCached(env, 'clips:all', clips, 900),
+    setCached(env, 'memes:all', memes, 900),
+    setCached(env, 'apk:alerts', apkVersions, 1800),
+    setCached(env, 'advance_servers:all', advanceServers, 1800),
+    setCached(env, 'categories:all', categories, 900),
+    setCached(env, 'stats', stats, 900),
+    setCached(env, 'last_scrape', { timestamp: new Date().toISOString(), items: allLeaks.length }, 900),
+  ]);
+
+  console.log(`[Worker] Scrape complete: ${allLeaks.length} leaks, ${apkVersions.length} APK versions, ${advanceServers.length} servers`);
+}
+
+// ---- API Query Helpers ----
+
+function filterByGame<T extends { game: string }>(items: T[], game?: string): T[] {
+  if (!game) return items;
+  return items.filter(item => item.game === game);
+}
+
+function paginate<T>(items: T[], limit?: number, offset?: number): { items: T[]; total: number; limit: number; offset: number } {
+  const l = limit || 20;
+  const o = offset || 0;
+  return {
+    items: items.slice(o, o + l),
+    total: items.length,
+    limit: l,
+    offset: o,
+  };
+}
+
+// ---- HTTP Handler ----
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Cache-Control': 'public, max-age=300', // 5 min browser cache
+    },
+  });
+}
+
+function errorResponse(message: string, status = 500): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
 
 export default {
-  // HTTP handler — serves cached data as fallback API
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Content-Type': 'application/json',
-    };
-
+    // CORS preflight
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
     }
 
     try {
-      // Health check
+      // ---- Health Check ----
       if (url.pathname === '/' || url.pathname === '/health') {
-        return new Response(JSON.stringify({
-          service: 'VaultDrop Worker',
-          version: '1.0.0',
+        const lastScrape = await getCached<{ timestamp: string; items: number }>(env, 'last_scrape');
+        return jsonResponse({
+          service: 'VaultDrop API',
+          version: '2.0.0',
           status: 'running',
+          last_scrape: lastScrape?.timestamp || 'never',
           timestamp: new Date().toISOString(),
-        }), { headers: corsHeaders });
+        });
       }
 
-      // Cached leaks endpoint (fallback for Railway)
-      if (url.pathname === '/leaks') {
-        const cached = await env.VAULTDROP_KV.get('latest_items');
-        if (cached) {
-          return new Response(cached, { headers: corsHeaders });
+      // ---- Leaks ----
+      if (url.pathname === '/leaks' || url.pathname === '/leaks/') {
+        const allLeaks = await getCached<Leak[]>(env, 'leaks:all') || [];
+        const game = url.searchParams.get('game') || undefined;
+        const category = url.searchParams.get('category') || undefined;
+        const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+        const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
+        let filtered = filterByGame(allLeaks, game);
+        if (category) {
+          filtered = filtered.filter(l => l.category === category);
         }
-        // If no cache, proxy to Railway
-        const railResp = await fetch(`${env.API_BASE}/leaks${url.search}`);
-        const data = await railResp.text();
-        return new Response(data, { headers: corsHeaders });
+
+        return jsonResponse(paginate(filtered, limit, offset));
       }
 
-      // APK versions cache
-      if (url.pathname === '/apk/alerts') {
-        const cached = await env.VAULTDROP_KV.get('apk_alerts');
-        if (cached) {
-          return new Response(cached, { headers: corsHeaders });
+      // ---- Leak Categories ----
+      if (url.pathname === '/leaks/categories' || url.pathname === '/leaks/categories/') {
+        const categories = await getCached<LeakCategory[]>(env, 'categories:all') || [];
+        return jsonResponse({ categories });
+      }
+
+      // ---- Clips ----
+      if (url.pathname === '/clips' || url.pathname === '/clips/') {
+        const allClips = await getCached<Clip[]>(env, 'clips:all') || [];
+        const game = url.searchParams.get('game') || undefined;
+        const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+        const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
+        return jsonResponse(paginate(filterByGame(allClips, game), limit, offset));
+      }
+
+      // ---- Memes ----
+      if (url.pathname === '/memes' || url.pathname === '/memes/') {
+        const allMemes = await getCached<Meme[]>(env, 'memes:all') || [];
+        const game = url.searchParams.get('game') || undefined;
+        const limit = parseInt(url.searchParams.get('limit') || '30', 10);
+        const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
+        return jsonResponse({
+          items: filterByGame(allMemes, game).slice(offset, offset + limit),
+          limit,
+          offset,
+        });
+      }
+
+      // ---- APK Alerts ----
+      if (url.pathname === '/apk/alerts' || url.pathname === '/apk/alerts/') {
+        const apkAlerts = await getCached<APKVersion[]>(env, 'apk:alerts') || [];
+        const game = url.searchParams.get('game') || undefined;
+
+        return jsonResponse({ alerts: filterByGame(apkAlerts, game) });
+      }
+
+      // ---- Advance Servers ----
+      if (url.pathname === '/advance-servers' || url.pathname === '/advance-servers/') {
+        const servers = await getCached<AdvanceServer[]>(env, 'advance_servers:all') || [];
+        const game = url.searchParams.get('game') || undefined;
+
+        return jsonResponse({ servers: filterByGame(servers, game) });
+      }
+
+      // ---- TapTap (placeholder) ----
+      if (url.pathname === '/taptap' || url.pathname === '/taptap/') {
+        return jsonResponse({ posts: [] });
+      }
+
+      // ---- Content (general query) ----
+      if (url.pathname === '/content' || url.pathname === '/content/') {
+        const type = url.searchParams.get('type') || undefined;
+        const game = url.searchParams.get('game') || undefined;
+
+        // Route to appropriate cached data
+        if (type === 'leak') {
+          const items = await getCached<Leak[]>(env, 'leaks:all') || [];
+          return jsonResponse(filterByGame(items, game));
         }
-        const railResp = await fetch(`${env.API_BASE}/apk/alerts${url.search}`);
-        const data = await railResp.text();
-        return new Response(data, { headers: corsHeaders });
+        if (type === 'clip') {
+          const items = await getCached<Clip[]>(env, 'clips:all') || [];
+          return jsonResponse(filterByGame(items, game));
+        }
+        if (type === 'meme') {
+          const items = await getCached<Meme[]>(env, 'memes:all') || [];
+          return jsonResponse(filterByGame(items, game));
+        }
+        if (type === 'apk_version') {
+          const items = await getCached<APKVersion[]>(env, 'apk:alerts') || [];
+          return jsonResponse(filterByGame(items, game));
+        }
+
+        // Return all stats if no type specified
+        const stats = await getCached<ContentStats>(env, 'stats') || {
+          leaks: 0, clips: 0, memes: 0, apk_versions: 0,
+          advance_servers: 0, taptap_posts: 0, scraper_runs: 0,
+          by_game: [], by_category: [],
+        };
+        return jsonResponse(stats);
       }
 
-      // Proxy all other requests to Railway
-      const railResp = await fetch(`${env.API_BASE}${url.pathname}${url.search}`);
-      const data = await railResp.text();
-      return new Response(data, { headers: corsHeaders });
+      // ---- Stats ----
+      if (url.pathname === '/stats' || url.pathname === '/stats/') {
+        const stats = await getCached<ContentStats>(env, 'stats') || {
+          leaks: 0, clips: 0, memes: 0, apk_versions: 0,
+          advance_servers: 0, taptap_posts: 0, scraper_runs: 0,
+          by_game: [], by_category: [],
+        };
+        return jsonResponse(stats);
+      }
+
+      // ---- Manual Scrape Trigger ----
+      if (url.pathname === '/scraper/trigger' && request.method === 'POST') {
+        ctx.waitUntil(runFullScrape(env));
+        return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
+      }
+
+      // Catch-all scraper trigger (compatibility with old endpoint pattern)
+      if (url.pathname.startsWith('/scraper/trigger/') && request.method === 'POST') {
+        ctx.waitUntil(runFullScrape(env));
+        return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
+      }
+
+      // ---- 404 ----
+      return errorResponse('Not found', 404);
 
     } catch (error) {
-      // If Railway is completely down, serve cached data
-      const cached = await env.VAULTDROP_KV.get('latest_items');
-      if (cached) {
-        return new Response(cached, { headers: corsHeaders });
-      }
-      return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
-        status: 503,
-        headers: corsHeaders,
-      });
+      console.error('[Worker] Request error:', error);
+      return errorResponse('Internal server error', 500);
     }
   },
 
-  // Cron handler — runs scheduled scraping
+  // ---- Cron Handler ----
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log('[Worker] Scheduled scrape starting...');
-
-    const allItems: ScrapedItem[] = [];
-
-    // 1. Scrape Reddit for all games
-    for (const [gameKey, urls] of Object.entries(REDDIT_SOURCES)) {
-      const items = await scrapeReddit(gameKey, urls);
-      allItems.push(...items);
-    }
-
-    // 2. Scrape cross-game subreddits
-    for (const url of CROSS_GAME_REDDIT) {
-      const items = await scrapeReddit('multi', [url]);
-      allItems.push(...items);
-    }
-
-    // 3. Monitor APK versions
-    const apkItems = await scrapeAPKVersions();
-    allItems.push(...apkItems);
-
-    // 4. Cache APK alerts
-    const apkAlerts = allItems.filter(i => i.type === 'apk_version');
-    if (apkAlerts.length) {
-      await env.VAULTDROP_KV.put('apk_alerts', JSON.stringify(apkAlerts), { expirationTtl: 1800 });
-    }
-
-    // 5. Push to Railway and cache
-    const pushed = await pushToRailwayAPI(env, allItems);
-
-    console.log(`[Worker] Scheduled scrape complete: ${allItems.length} items, ${pushed} pushed`);
+    ctx.waitUntil(runFullScrape(env));
   },
 };
