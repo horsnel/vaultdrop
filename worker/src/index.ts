@@ -1,33 +1,30 @@
 /**
  * VaultDrop CloudFlare Worker — Primary API & Scraper
  *
- * This worker serves as:
- * 1. The primary API for the VaultDrop frontend (replaces Railway)
- * 2. A caching layer using Cloudflare KV
- * 3. A scheduled scraper that runs every 15 minutes via Cron
+ * Data Storage: GitHub (repos/contents API on a `data` branch)
+ * - Reads from raw.githubusercontent.com (fast, CDN-backed)
+ * - Writes via GitHub Contents API (PUT commits)
+ * - No KV dependency — data is versioned and free
  *
  * API Endpoints:
- * - GET /health              — Health check
- * - GET /leaks               — Paginated leaks (supports ?game=&category=&limit=&offset=)
+ * - GET /health              — Health check + last scrape time
+ * - GET /leaks               — Paginated leaks (?game=&category=&limit=&offset=)
  * - GET /leaks/categories    — Leak categories with counts
- * - GET /clips               — Paginated clips (supports ?game=&limit=&offset=)
- * - GET /memes               — Paginated memes (supports ?game=&limit=&offset=)
- * - GET /apk/alerts          — APK version alerts (supports ?game=)
- * - GET /advance-servers     — Advance server status (supports ?game=)
- * - GET /taptap              — TapTap posts (supports ?game=)
+ * - GET /clips               — Paginated clips (?game=&limit=&offset=)
+ * - GET /memes               — Paginated memes (?game=&limit=&offset=)
+ * - GET /apk/alerts          — APK version alerts (?game=)
+ * - GET /advance-servers     — Advance server status (?game=)
+ * - GET /taptap              — TapTap posts (?game=)
  * - GET /stats               — Content statistics
- * - GET /content             — General content query (supports ?type=&game=)
+ * - GET /content             — General content query (?type=&game=)
  * - POST /scraper/trigger    — Manually trigger a scrape run
- *
- * Scrapers:
- * - Reddit leak scraper (game-specific subreddits + cross-game)
- * - APK Version Monitor (APKMirror for all 4 games)
- * - Advance server status checker
  */
 
 export interface Env {
-  VAULTDROP_KV: KVNamespace;
-  API_BASE: string; // kept for future use but no longer proxies to Railway
+  GITHUB_TOKEN: string; // Secret: GitHub PAT for repo read/write
+  REPO_OWNER: string;   // e.g. "horsnel"
+  REPO_NAME: string;    // e.g. "vaultdrop"
+  DATA_BRANCH: string;  // e.g. "data"
 }
 
 // ---- Types ----
@@ -123,6 +120,71 @@ interface ContentStats {
   by_category: { category: string; count: number }[];
 }
 
+// ---- GitHub Storage ----
+
+const RAW_BASE = 'https://raw.githubusercontent.com';
+
+function rawUrl(env: Env, path: string): string {
+  return `${RAW_BASE}/${env.REPO_OWNER}/${env.REPO_NAME}/${env.DATA_BRANCH}/${path}`;
+}
+
+async function readJSON<T>(env: Env, path: string): Promise<T | null> {
+  try {
+    const resp = await fetch(rawUrl(env, path), {
+      headers: { 'User-Agent': 'VaultDrop-Worker/2.0' },
+    });
+    if (!resp.ok) return null;
+    return await resp.json() as T;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJSON(env: Env, path: string, data: unknown): Promise<boolean> {
+  try {
+    const apiBase = `https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/${path}`;
+
+    // Get the current file SHA (needed for update)
+    const headResp = await fetch(`${apiBase}?ref=${env.DATA_BRANCH}`, {
+      headers: {
+        'Authorization': `token ${env.GITHUB_TOKEN}`,
+        'User-Agent': 'VaultDrop-Worker/2.0',
+        'Accept': 'application/vnd.github.v3+json',
+      },
+    });
+
+    let sha: string | null = null;
+    if (headResp.ok) {
+      const headData = await headResp.json() as any;
+      sha = headData.sha || null;
+    }
+
+    // PUT the file
+    const body: Record<string, unknown> = {
+      message: `auto: update ${path} [skip ci]`,
+      content: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
+      branch: env.DATA_BRANCH,
+    };
+    if (sha) body.sha = sha;
+
+    const putResp = await fetch(`${apiBase}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${env.GITHUB_TOKEN}`,
+        'User-Agent': 'VaultDrop-Worker/2.0',
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    return putResp.ok;
+  } catch (e) {
+    console.error(`[Worker] GitHub write error for ${path}:`, e);
+    return false;
+  }
+}
+
 // ---- Scraping Config ----
 
 const APKMIRROR_APPS: Record<string, { url: string; pkg: string; name: string }> = {
@@ -170,7 +232,6 @@ const CROSS_GAME_REDDIT = [
   'https://www.reddit.com/r/GamingLeaksAndRumours/search.json?q=codm+OR+pubgm+OR+free+fire+OR+blood+strike&sort=new&limit=10',
 ];
 
-// Advance server check URLs (official & community sources)
 const ADVANCE_SERVER_SOURCES: Record<string, { url: string; name: string }> = {
   CODM: { url: 'https://www.callofduty.com/mobile/test', name: 'CODM Test Server' },
   PUBGM: { url: 'https://www.pubgmobile.com/news', name: 'PUBGM Beta Server' },
@@ -204,25 +265,6 @@ function classifyCategory(text: string): string {
     }
   }
   return best;
-}
-
-// ---- KV Helpers ----
-
-async function getCached<T>(env: Env, key: string): Promise<T | null> {
-  try {
-    const raw = await env.VAULTDROP_KV.get(key);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function setCached(env: Env, key: string, value: unknown, ttl = 900): Promise<void> {
-  try {
-    await env.VAULTDROP_KV.put(key, JSON.stringify(value), { expirationTtl: ttl });
-  } catch (e) {
-    console.error(`[Worker] KV write error for ${key}:`, e);
-  }
 }
 
 // ---- Scraping Functions ----
@@ -284,9 +326,12 @@ async function scrapeReddit(gameKey: string, urls: string[]): Promise<Leak[]> {
   return items;
 }
 
-async function scrapeAPKVersions(): Promise<APKVersion[]> {
+async function scrapeAPKVersions(env: Env): Promise<APKVersion[]> {
   const items: APKVersion[] = [];
   let idCounter = Date.now() + 100000;
+
+  // Load known versions from GitHub for change detection
+  const knownVersions = await readJSON<Record<string, string[]>>(env, 'apk_known_versions.json') || {};
 
   for (const [gameKey, appInfo] of Object.entries(APKMIRROR_APPS)) {
     try {
@@ -311,7 +356,10 @@ async function scrapeAPKVersions(): Promise<APKVersion[]> {
         }
       }
 
+      const gameKnown = knownVersions[gameKey] || [];
+
       for (const version of versions) {
+        const isNew = !gameKnown.includes(version);
         const isBeta = /beta|test|rc|alpha/i.test(version);
 
         items.push({
@@ -325,11 +373,20 @@ async function scrapeAPKVersions(): Promise<APKVersion[]> {
           is_beta: isBeta,
           detected_at: new Date().toISOString(),
         });
+
+        if (isNew) {
+          gameKnown.push(version);
+        }
       }
+
+      knownVersions[gameKey] = gameKnown;
     } catch (e) {
       console.error(`[Worker] APK scrape error for ${gameKey}:`, e);
     }
   }
+
+  // Persist known versions for next run
+  await writeJSON(env, 'apk_known_versions.json', knownVersions);
 
   return items;
 }
@@ -346,7 +403,6 @@ async function scrapeAdvanceServers(): Promise<AdvanceServer[]> {
         redirect: 'follow',
       });
 
-      // If the URL responds, we assume the server page is available
       const isOpen = resp.ok || resp.status === 200 || resp.status === 301 || resp.status === 302;
 
       items.push({
@@ -378,11 +434,10 @@ async function scrapeAdvanceServers(): Promise<AdvanceServer[]> {
   return items;
 }
 
-async function generateClipsFromLeaks(leaks: Leak[]): Promise<Clip[]> {
-  // Generate clips from Reddit video posts
+function deriveClipsFromLeaks(leaks: Leak[]): Clip[] {
   return leaks
     .filter(l => l.media_url && (l.media_url.includes('v.redd.it') || l.media_url.includes('youtu')))
-    .map((l, i) => ({
+    .map((l) => ({
       id: l.id + 300000,
       game: l.game,
       title: l.title,
@@ -396,8 +451,7 @@ async function generateClipsFromLeaks(leaks: Leak[]): Promise<Clip[]> {
     }));
 }
 
-async function generateMemesFromLeaks(leaks: Leak[]): Promise<Meme[]> {
-  // Generate memes from Reddit image posts
+function deriveMemesFromLeaks(leaks: Leak[]): Meme[] {
   return leaks
     .filter(l => l.thumbnail_url && !l.media_url)
     .map((l) => ({
@@ -417,8 +471,6 @@ async function runFullScrape(env: Env): Promise<void> {
   console.log('[Worker] Starting full scrape...');
 
   const allLeaks: Leak[] = [];
-  const allClips: Clip[] = [];
-  const allMemes: Meme[] = [];
 
   // 1. Scrape Reddit for all games
   for (const [gameKey, urls] of Object.entries(REDDIT_SOURCES)) {
@@ -428,19 +480,19 @@ async function runFullScrape(env: Env): Promise<void> {
 
   // 2. Scrape cross-game subreddits
   for (const url of CROSS_GAME_REDDIT) {
-    const leaks = await scrapeReddit('CODM', [url]); // default to CODM for cross-game
+    const leaks = await scrapeReddit('CODM', [url]);
     allLeaks.push(...leaks);
   }
 
-  // 3. Scrape APK versions
-  const apkVersions = await scrapeAPKVersions();
+  // 3. Scrape APK versions (also persists known versions to GitHub)
+  const apkVersions = await scrapeAPKVersions(env);
 
   // 4. Scrape advance servers
   const advanceServers = await scrapeAdvanceServers();
 
   // 5. Derive clips & memes from leaks
-  const clips = await generateClipsFromLeaks(allLeaks);
-  const memes = await generateMemesFromLeaks(allLeaks);
+  const clips = deriveClipsFromLeaks(allLeaks);
+  const memes = deriveMemesFromLeaks(allLeaks);
 
   // 6. Compute categories
   const categoryMap: Record<string, number> = {};
@@ -470,16 +522,21 @@ async function runFullScrape(env: Env): Promise<void> {
     by_category: categories,
   };
 
-  // 8. Cache everything in KV (15 min TTL)
+  const lastScrape = {
+    timestamp: new Date().toISOString(),
+    items: allLeaks.length,
+  };
+
+  // 8. Write all data to GitHub data branch
   await Promise.all([
-    setCached(env, 'leaks:all', allLeaks, 900),
-    setCached(env, 'clips:all', clips, 900),
-    setCached(env, 'memes:all', memes, 900),
-    setCached(env, 'apk:alerts', apkVersions, 1800),
-    setCached(env, 'advance_servers:all', advanceServers, 1800),
-    setCached(env, 'categories:all', categories, 900),
-    setCached(env, 'stats', stats, 900),
-    setCached(env, 'last_scrape', { timestamp: new Date().toISOString(), items: allLeaks.length }, 900),
+    writeJSON(env, 'leaks.json', allLeaks),
+    writeJSON(env, 'clips.json', clips),
+    writeJSON(env, 'memes.json', memes),
+    writeJSON(env, 'apk_alerts.json', apkVersions),
+    writeJSON(env, 'advance_servers.json', advanceServers),
+    writeJSON(env, 'categories.json', categories),
+    writeJSON(env, 'stats.json', stats),
+    writeJSON(env, 'last_scrape.json', lastScrape),
   ]);
 
   console.log(`[Worker] Scrape complete: ${allLeaks.length} leaks, ${apkVersions.length} APK versions, ${advanceServers.length} servers`);
@@ -513,7 +570,7 @@ function jsonResponse(data: unknown, status = 200): Response {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
-      'Cache-Control': 'public, max-age=300', // 5 min browser cache
+      'Cache-Control': 'public, max-age=300',
     },
   });
 }
@@ -546,11 +603,12 @@ export default {
     try {
       // ---- Health Check ----
       if (url.pathname === '/' || url.pathname === '/health') {
-        const lastScrape = await getCached<{ timestamp: string; items: number }>(env, 'last_scrape');
+        const lastScrape = await readJSON<{ timestamp: string; items: number }>(env, 'last_scrape.json');
         return jsonResponse({
           service: 'VaultDrop API',
           version: '2.0.0',
           status: 'running',
+          storage: 'github',
           last_scrape: lastScrape?.timestamp || 'never',
           timestamp: new Date().toISOString(),
         });
@@ -558,7 +616,7 @@ export default {
 
       // ---- Leaks ----
       if (url.pathname === '/leaks' || url.pathname === '/leaks/') {
-        const allLeaks = await getCached<Leak[]>(env, 'leaks:all') || [];
+        const allLeaks = await readJSON<Leak[]>(env, 'leaks.json') || [];
         const game = url.searchParams.get('game') || undefined;
         const category = url.searchParams.get('category') || undefined;
         const limit = parseInt(url.searchParams.get('limit') || '20', 10);
@@ -574,13 +632,13 @@ export default {
 
       // ---- Leak Categories ----
       if (url.pathname === '/leaks/categories' || url.pathname === '/leaks/categories/') {
-        const categories = await getCached<LeakCategory[]>(env, 'categories:all') || [];
+        const categories = await readJSON<LeakCategory[]>(env, 'categories.json') || [];
         return jsonResponse({ categories });
       }
 
       // ---- Clips ----
       if (url.pathname === '/clips' || url.pathname === '/clips/') {
-        const allClips = await getCached<Clip[]>(env, 'clips:all') || [];
+        const allClips = await readJSON<Clip[]>(env, 'clips.json') || [];
         const game = url.searchParams.get('game') || undefined;
         const limit = parseInt(url.searchParams.get('limit') || '20', 10);
         const offset = parseInt(url.searchParams.get('offset') || '0', 10);
@@ -590,7 +648,7 @@ export default {
 
       // ---- Memes ----
       if (url.pathname === '/memes' || url.pathname === '/memes/') {
-        const allMemes = await getCached<Meme[]>(env, 'memes:all') || [];
+        const allMemes = await readJSON<Meme[]>(env, 'memes.json') || [];
         const game = url.searchParams.get('game') || undefined;
         const limit = parseInt(url.searchParams.get('limit') || '30', 10);
         const offset = parseInt(url.searchParams.get('offset') || '0', 10);
@@ -604,7 +662,7 @@ export default {
 
       // ---- APK Alerts ----
       if (url.pathname === '/apk/alerts' || url.pathname === '/apk/alerts/') {
-        const apkAlerts = await getCached<APKVersion[]>(env, 'apk:alerts') || [];
+        const apkAlerts = await readJSON<APKVersion[]>(env, 'apk_alerts.json') || [];
         const game = url.searchParams.get('game') || undefined;
 
         return jsonResponse({ alerts: filterByGame(apkAlerts, game) });
@@ -612,7 +670,7 @@ export default {
 
       // ---- Advance Servers ----
       if (url.pathname === '/advance-servers' || url.pathname === '/advance-servers/') {
-        const servers = await getCached<AdvanceServer[]>(env, 'advance_servers:all') || [];
+        const servers = await readJSON<AdvanceServer[]>(env, 'advance_servers.json') || [];
         const game = url.searchParams.get('game') || undefined;
 
         return jsonResponse({ servers: filterByGame(servers, game) });
@@ -628,26 +686,24 @@ export default {
         const type = url.searchParams.get('type') || undefined;
         const game = url.searchParams.get('game') || undefined;
 
-        // Route to appropriate cached data
         if (type === 'leak') {
-          const items = await getCached<Leak[]>(env, 'leaks:all') || [];
+          const items = await readJSON<Leak[]>(env, 'leaks.json') || [];
           return jsonResponse(filterByGame(items, game));
         }
         if (type === 'clip') {
-          const items = await getCached<Clip[]>(env, 'clips:all') || [];
+          const items = await readJSON<Clip[]>(env, 'clips.json') || [];
           return jsonResponse(filterByGame(items, game));
         }
         if (type === 'meme') {
-          const items = await getCached<Meme[]>(env, 'memes:all') || [];
+          const items = await readJSON<Meme[]>(env, 'memes.json') || [];
           return jsonResponse(filterByGame(items, game));
         }
         if (type === 'apk_version') {
-          const items = await getCached<APKVersion[]>(env, 'apk:alerts') || [];
+          const items = await readJSON<APKVersion[]>(env, 'apk_alerts.json') || [];
           return jsonResponse(filterByGame(items, game));
         }
 
-        // Return all stats if no type specified
-        const stats = await getCached<ContentStats>(env, 'stats') || {
+        const stats = await readJSON<ContentStats>(env, 'stats.json') || {
           leaks: 0, clips: 0, memes: 0, apk_versions: 0,
           advance_servers: 0, taptap_posts: 0, scraper_runs: 0,
           by_game: [], by_category: [],
@@ -657,7 +713,7 @@ export default {
 
       // ---- Stats ----
       if (url.pathname === '/stats' || url.pathname === '/stats/') {
-        const stats = await getCached<ContentStats>(env, 'stats') || {
+        const stats = await readJSON<ContentStats>(env, 'stats.json') || {
           leaks: 0, clips: 0, memes: 0, apk_versions: 0,
           advance_servers: 0, taptap_posts: 0, scraper_runs: 0,
           by_game: [], by_category: [],
@@ -671,7 +727,7 @@ export default {
         return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
       }
 
-      // Catch-all scraper trigger (compatibility with old endpoint pattern)
+      // Catch-all scraper trigger (compatibility)
       if (url.pathname.startsWith('/scraper/trigger/') && request.method === 'POST') {
         ctx.waitUntil(runFullScrape(env));
         return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
