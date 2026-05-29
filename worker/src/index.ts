@@ -6,6 +6,13 @@
  * - Writes via GitHub Contents API (PUT commits)
  * - No KV dependency — data is versioned and free
  *
+ * Scraping Strategy:
+ * - Reddit: Uses OAuth2 client_credentials flow (reddit.com/api/v1/access_token)
+ *   to authenticate API requests (avoids 403 blocks on unauthenticated requests)
+ * - APKMirror: Moved to GitHub Actions (Cloudflare JS challenge blocks Workers)
+ * - Advance Servers: Simple HEAD request check (still works from Workers)
+ * - Full scrape also triggered by GitHub Actions every 2 hours
+ *
  * API Endpoints:
  * - GET /health              — Health check + last scrape time
  * - GET /leaks               — Paginated leaks (?game=&category=&limit=&offset=)
@@ -18,13 +25,17 @@
  * - GET /stats               — Content statistics
  * - GET /content             — General content query (?type=&game=)
  * - POST /scraper/trigger    — Manually trigger a scrape run
+ * - POST /scraper/ingest     — Receive scraped data from GitHub Actions
  */
 
 export interface Env {
-  GITHUB_TOKEN: string; // Secret: GitHub PAT for repo read/write
-  REPO_OWNER: string;   // e.g. "horsnel"
-  REPO_NAME: string;    // e.g. "vaultdrop"
-  DATA_BRANCH: string;  // e.g. "data"
+  GITHUB_TOKEN: string;        // Secret: GitHub PAT for repo read/write
+  REPO_OWNER: string;          // e.g. "horsnel"
+  REPO_NAME: string;           // e.g. "vaultdrop"
+  DATA_BRANCH: string;         // e.g. "data"
+  REDDIT_CLIENT_ID: string;    // Secret: Reddit app client ID
+  REDDIT_CLIENT_SECRET: string;// Secret: Reddit app client secret
+  SCRAPER_SECRET: string;      // Secret: Shared secret for /scraper/ingest auth
 }
 
 // ---- Types ----
@@ -185,52 +196,68 @@ async function writeJSON(env: Env, path: string, data: unknown): Promise<boolean
   }
 }
 
+// ---- Reddit OAuth2 ----
+
+let redditAccessToken: string | null = null;
+let redditTokenExpiry = 0;
+
+async function getRedditToken(env: Env): Promise<string | null> {
+  // Return cached token if still valid
+  if (redditAccessToken && Date.now() < redditTokenExpiry) {
+    return redditAccessToken;
+  }
+
+  // Reddit OAuth2 client_credentials grant
+  const creds = btoa(`${env.REDDIT_CLIENT_ID}:${env.REDDIT_CLIENT_SECRET}`);
+
+  try {
+    const resp = await fetch('https://www.reddit.com/api/v1/access_token', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${creds}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'VaultDrop/2.0 by horsnel',
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    if (!resp.ok) {
+      console.error(`[Worker] Reddit OAuth error: ${resp.status}`);
+      return null;
+    }
+
+    const data = await resp.json() as any;
+    redditAccessToken = data.access_token;
+    redditTokenExpiry = Date.now() + ((data.expires_in || 3600) - 60) * 1000; // 1 min buffer
+
+    console.log('[Worker] Reddit OAuth token obtained');
+    return redditAccessToken;
+  } catch (e) {
+    console.error('[Worker] Reddit OAuth error:', e);
+    return null;
+  }
+}
+
 // ---- Scraping Config ----
 
-const APKMIRROR_APPS: Record<string, { url: string; pkg: string; name: string }> = {
+const REDDIT_SOURCES: Record<string, { subreddits: string[]; searchQueries: string[] }> = {
   CODM: {
-    url: 'https://www.apkmirror.com/apk/activision-publishing-inc/call-of-duty-mobile/',
-    pkg: 'com.activision.callofduty.shooter',
-    name: 'Call of Duty: Mobile',
+    subreddits: ['CODMobileLeaks', 'CallOfDutyMobile'],
+    searchQueries: ['codm leak', 'cod mobile leak'],
   },
   PUBGM: {
-    url: 'https://www.apkmirror.com/apk/proxima-beta/pubg-mobile-arcade-shooting/',
-    pkg: 'com.tencent.ig',
-    name: 'PUBG Mobile',
+    subreddits: ['PUBGMobileLeaks', 'BGMI'],
+    searchQueries: ['pubgm leak', 'pubg mobile leak'],
   },
   'Free Fire': {
-    url: 'https://www.apkmirror.com/apk/garena-online-private/garena-free-fire/',
-    pkg: 'com.dts.freefireth',
-    name: 'Free Fire',
+    subreddits: ['FreeFireLeaks', 'freefire'],
+    searchQueries: ['free fire leak', 'free fire advance server'],
   },
   'Blood Strike': {
-    url: 'https://www.apkmirror.com/apk/netease-games/blood-strike/',
-    pkg: 'com.netease.bs',
-    name: 'Blood Strike',
+    subreddits: ['BloodStrike'],
+    searchQueries: ['blood strike leak', 'blood strike update'],
   },
 };
-
-const REDDIT_SOURCES: Record<string, string[]> = {
-  CODM: [
-    'https://www.reddit.com/r/CODMobileLeaks/new.json?limit=10',
-    'https://www.reddit.com/r/CallOfDutyMobile/new.json?limit=10',
-  ],
-  PUBGM: [
-    'https://www.reddit.com/r/PUBGMobileLeaks/new.json?limit=10',
-    'https://www.reddit.com/r/BGMI/new.json?limit=10',
-  ],
-  'Free Fire': [
-    'https://www.reddit.com/r/FreeFireLeaks/new.json?limit=10',
-    'https://www.reddit.com/r/freefire/new.json?limit=10',
-  ],
-  'Blood Strike': [
-    'https://www.reddit.com/r/BloodStrike/new.json?limit=10',
-  ],
-};
-
-const CROSS_GAME_REDDIT = [
-  'https://www.reddit.com/r/GamingLeaksAndRumours/search.json?q=codm+OR+pubgm+OR+free+fire+OR+blood+strike&sort=new&limit=10',
-];
 
 const ADVANCE_SERVER_SOURCES: Record<string, { url: string; name: string }> = {
   CODM: { url: 'https://www.callofduty.com/mobile/test', name: 'CODM Test Server' },
@@ -269,20 +296,35 @@ function classifyCategory(text: string): string {
 
 // ---- Scraping Functions ----
 
-async function scrapeReddit(gameKey: string, urls: string[]): Promise<Leak[]> {
+async function scrapeReddit(env: Env, gameKey: string): Promise<Leak[]> {
   const items: Leak[] = [];
-  let idCounter = Date.now();
+  let idCounter = Date.now() + gameKey.length * 10000;
 
-  for (const url of urls) {
+  const config = REDDIT_SOURCES[gameKey];
+  if (!config) return items;
+
+  const token = await getRedditToken(env);
+  if (!token) {
+    console.warn(`[Worker] No Reddit token — skipping ${gameKey}`);
+    return items;
+  }
+
+  const authHeaders: Record<string, string> = {
+    'Authorization': `Bearer ${token}`,
+    'User-Agent': 'VaultDrop/2.0 by horsnel',
+    'Accept': 'application/json',
+  };
+
+  // 1. Fetch new posts from each subreddit
+  for (const subreddit of config.subreddits) {
     try {
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'VaultDrop/2.0 (Content Aggregator)',
-          'Accept': 'application/json',
-        },
-      });
+      const url = `https://oauth.reddit.com/r/${subreddit}/new?limit=15`;
+      const resp = await fetch(url, { headers: authHeaders });
 
-      if (!resp.ok) continue;
+      if (!resp.ok) {
+        console.warn(`[Worker] Reddit r/${subreddit} returned ${resp.status}`);
+        continue;
+      }
 
       const data = await resp.json() as any;
       const children = data?.data?.children || [];
@@ -319,74 +361,55 @@ async function scrapeReddit(gameKey: string, urls: string[]): Promise<Leak[]> {
         });
       }
     } catch (e) {
-      console.error(`[Worker] Reddit scrape error for ${gameKey}:`, e);
+      console.error(`[Worker] Reddit scrape error for r/${subreddit}:`, e);
     }
   }
 
-  return items;
-}
-
-async function scrapeAPKVersions(env: Env): Promise<APKVersion[]> {
-  const items: APKVersion[] = [];
-  let idCounter = Date.now() + 100000;
-
-  // Load known versions from GitHub for change detection
-  const knownVersions = await readJSON<Record<string, string[]>>(env, 'apk_known_versions.json') || {};
-
-  for (const [gameKey, appInfo] of Object.entries(APKMIRROR_APPS)) {
+  // 2. Search for game-specific leaks across all of Reddit
+  for (const query of config.searchQueries) {
     try {
-      const resp = await fetch(appInfo.url, {
-        headers: {
-          'User-Agent': 'VaultDrop/2.0 (Content Aggregator)',
-        },
-      });
+      const url = `https://oauth.reddit.com/search?q=${encodeURIComponent(query)}&sort=new&limit=10&type=link`;
+      const resp = await fetch(url, { headers: authHeaders });
 
       if (!resp.ok) continue;
 
-      const html = await resp.text();
+      const data = await resp.json() as any;
+      const children = data?.data?.children || [];
 
-      // Extract version numbers from the page
-      const versionRegex = /href="\/apk\/[^"]+\/([\d.]+)[^"]*"/g;
-      const versions = new Set<string>();
-      let match;
+      for (const child of children) {
+        const post = child.data || {};
+        const title = post.title?.trim();
+        if (!title) continue;
 
-      while ((match = versionRegex.exec(html)) !== null) {
-        if (match[1] && /^\d/.test(match[1])) {
-          versions.add(match[1]);
-        }
-      }
+        // Avoid duplicates
+        if (items.some(i => i.title === title && i.source_name === `r/${post.subreddit}`)) continue;
 
-      const gameKnown = knownVersions[gameKey] || [];
-
-      for (const version of versions) {
-        const isNew = !gameKnown.includes(version);
-        const isBeta = /beta|test|rc|alpha/i.test(version);
+        const flair = post.link_flair_text || '';
+        const category = classifyCategory(title + ' ' + flair);
+        const thumbnail = post.thumbnail?.startsWith('http') ? post.thumbnail : '';
 
         items.push({
           id: idCounter++,
           game: gameKey,
-          package_name: appInfo.pkg,
-          version_name: version,
-          version_code: parseInt(version.replace(/\./g, ''), 10) || 0,
-          source: 'APKMirror',
-          source_url: appInfo.url,
-          is_beta: isBeta,
-          detected_at: new Date().toISOString(),
+          title,
+          description: (post.selftext || '').slice(0, 500),
+          category,
+          source_url: `https://reddit.com${post.permalink || ''}`,
+          source_name: `r/${post.subreddit || 'unknown'}`,
+          thumbnail_url: thumbnail,
+          media_url: post.url?.startsWith('http') && !post.url.includes('reddit.com') ? post.url : '',
+          ai_caption: '',
+          severity: ['mythic', 'legendary', 'leak', 'datamine', 'beta'].some(kw =>
+            title.toLowerCase().includes(kw)
+          ) ? 'high' : 'normal',
+          is_verified: (post.score || 0) > 50,
+          created_at: new Date((post.created_utc || 0) * 1000).toISOString(),
         });
-
-        if (isNew) {
-          gameKnown.push(version);
-        }
       }
-
-      knownVersions[gameKey] = gameKnown;
     } catch (e) {
-      console.error(`[Worker] APK scrape error for ${gameKey}:`, e);
+      console.error(`[Worker] Reddit search error for "${query}":`, e);
     }
   }
-
-  // Persist known versions for next run
-  await writeJSON(env, 'apk_known_versions.json', knownVersions);
 
   return items;
 }
@@ -465,36 +488,30 @@ function deriveMemesFromLeaks(leaks: Leak[]): Meme[] {
     }));
 }
 
-// ---- Full Scrape Run ----
+// ---- Full Scrape Run (Worker-side) ----
 
 async function runFullScrape(env: Env): Promise<void> {
   console.log('[Worker] Starting full scrape...');
 
   const allLeaks: Leak[] = [];
 
-  // 1. Scrape Reddit for all games
-  for (const [gameKey, urls] of Object.entries(REDDIT_SOURCES)) {
-    const leaks = await scrapeReddit(gameKey, urls);
+  // 1. Scrape Reddit for all games (using OAuth2)
+  for (const gameKey of Object.keys(REDDIT_SOURCES)) {
+    const leaks = await scrapeReddit(env, gameKey);
     allLeaks.push(...leaks);
   }
 
-  // 2. Scrape cross-game subreddits
-  for (const url of CROSS_GAME_REDDIT) {
-    const leaks = await scrapeReddit('CODM', [url]);
-    allLeaks.push(...leaks);
-  }
+  // 2. Read existing APK data from GitHub (APKMirror scraping is done by GitHub Actions)
+  const apkVersions = await readJSON<APKVersion[]>(env, 'apk_alerts.json') || [];
 
-  // 3. Scrape APK versions (also persists known versions to GitHub)
-  const apkVersions = await scrapeAPKVersions(env);
-
-  // 4. Scrape advance servers
+  // 3. Scrape advance servers
   const advanceServers = await scrapeAdvanceServers();
 
-  // 5. Derive clips & memes from leaks
+  // 4. Derive clips & memes from leaks
   const clips = deriveClipsFromLeaks(allLeaks);
   const memes = deriveMemesFromLeaks(allLeaks);
 
-  // 6. Compute categories
+  // 5. Compute categories
   const categoryMap: Record<string, number> = {};
   for (const leak of allLeaks) {
     categoryMap[leak.category] = (categoryMap[leak.category] || 0) + 1;
@@ -504,7 +521,7 @@ async function runFullScrape(env: Env): Promise<void> {
     count,
   }));
 
-  // 7. Compute stats
+  // 6. Compute stats
   const gameCountMap: Record<string, number> = {};
   for (const leak of allLeaks) {
     gameCountMap[leak.game] = (gameCountMap[leak.game] || 0) + 1;
@@ -525,9 +542,75 @@ async function runFullScrape(env: Env): Promise<void> {
   const lastScrape = {
     timestamp: new Date().toISOString(),
     items: allLeaks.length,
+    source: 'worker',
   };
 
-  // 8. Write all data to GitHub data branch
+  // 7. Write all data to GitHub data branch
+  await Promise.all([
+    writeJSON(env, 'leaks.json', allLeaks),
+    writeJSON(env, 'clips.json', clips),
+    writeJSON(env, 'memes.json', memes),
+    writeJSON(env, 'advance_servers.json', advanceServers),
+    writeJSON(env, 'categories.json', categories),
+    writeJSON(env, 'stats.json', stats),
+    writeJSON(env, 'last_scrape.json', lastScrape),
+  ]);
+
+  console.log(`[Worker] Scrape complete: ${allLeaks.length} leaks, ${apkVersions.length} APK versions, ${advanceServers.length} servers`);
+}
+
+// ---- Ingest Scrape Data from GitHub Actions ----
+
+interface IngestPayload {
+  leaks?: Leak[];
+  apk_alerts?: APKVersion[];
+  advance_servers?: AdvanceServer[];
+  source?: string;
+}
+
+async function ingestScrapeData(env: Env, payload: IngestPayload): Promise<void> {
+  console.log(`[Worker] Ingesting scrape data from ${payload.source || 'external'}`);
+
+  const allLeaks = payload.leaks || [];
+  const apkVersions = payload.apk_alerts || [];
+  const advanceServers = payload.advance_servers || await scrapeAdvanceServers();
+  const clips = deriveClipsFromLeaks(allLeaks);
+  const memes = deriveMemesFromLeaks(allLeaks);
+
+  // Compute categories
+  const categoryMap: Record<string, number> = {};
+  for (const leak of allLeaks) {
+    categoryMap[leak.category] = (categoryMap[leak.category] || 0) + 1;
+  }
+  const categories: LeakCategory[] = Object.entries(categoryMap).map(([category, count]) => ({
+    category,
+    count,
+  }));
+
+  // Compute stats
+  const gameCountMap: Record<string, number> = {};
+  for (const leak of allLeaks) {
+    gameCountMap[leak.game] = (gameCountMap[leak.game] || 0) + 1;
+  }
+
+  const stats: ContentStats = {
+    leaks: allLeaks.length,
+    clips: clips.length,
+    memes: memes.length,
+    apk_versions: apkVersions.length,
+    advance_servers: advanceServers.length,
+    taptap_posts: 0,
+    scraper_runs: 0,
+    by_game: Object.entries(gameCountMap).map(([game, count]) => ({ game, count })),
+    by_category: categories,
+  };
+
+  const lastScrape = {
+    timestamp: new Date().toISOString(),
+    items: allLeaks.length,
+    source: payload.source || 'github-actions',
+  };
+
   await Promise.all([
     writeJSON(env, 'leaks.json', allLeaks),
     writeJSON(env, 'clips.json', clips),
@@ -539,7 +622,7 @@ async function runFullScrape(env: Env): Promise<void> {
     writeJSON(env, 'last_scrape.json', lastScrape),
   ]);
 
-  console.log(`[Worker] Scrape complete: ${allLeaks.length} leaks, ${apkVersions.length} APK versions, ${advanceServers.length} servers`);
+  console.log(`[Worker] Ingest complete: ${allLeaks.length} leaks, ${apkVersions.length} APK versions, ${advanceServers.length} servers`);
 }
 
 // ---- API Query Helpers ----
@@ -569,7 +652,7 @@ function jsonResponse(data: unknown, status = 200): Response {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Scraper-Secret',
       'Cache-Control': 'public, max-age=300',
     },
   });
@@ -595,7 +678,7 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
+          'Access-Control-Allow-Headers': 'Content-Type, X-Scraper-Secret',
         },
       });
     }
@@ -603,13 +686,14 @@ export default {
     try {
       // ---- Health Check ----
       if (url.pathname === '/' || url.pathname === '/health') {
-        const lastScrape = await readJSON<{ timestamp: string; items: number }>(env, 'last_scrape.json');
+        const lastScrape = await readJSON<{ timestamp: string; items: number; source: string }>(env, 'last_scrape.json');
         return jsonResponse({
           service: 'VaultDrop API',
-          version: '2.0.0',
+          version: '2.1.0',
           status: 'running',
           storage: 'github',
           last_scrape: lastScrape?.timestamp || 'never',
+          last_scrape_source: lastScrape?.source || 'none',
           timestamp: new Date().toISOString(),
         });
       }
@@ -721,16 +805,29 @@ export default {
         return jsonResponse(stats);
       }
 
-      // ---- Manual Scrape Trigger ----
+      // ---- Manual Scrape Trigger (Worker scrapes Reddit directly) ----
       if (url.pathname === '/scraper/trigger' && request.method === 'POST') {
         ctx.waitUntil(runFullScrape(env));
-        return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
+        return jsonResponse({ message: 'Scrape triggered (Worker-side)', timestamp: new Date().toISOString() });
       }
 
       // Catch-all scraper trigger (compatibility)
       if (url.pathname.startsWith('/scraper/trigger/') && request.method === 'POST') {
         ctx.waitUntil(runFullScrape(env));
-        return jsonResponse({ message: 'Scrape triggered', timestamp: new Date().toISOString() });
+        return jsonResponse({ message: 'Scrape triggered (Worker-side)', timestamp: new Date().toISOString() });
+      }
+
+      // ---- Ingest Scrape Data from GitHub Actions ----
+      if (url.pathname === '/scraper/ingest' && request.method === 'POST') {
+        // Verify shared secret
+        const providedSecret = request.headers.get('X-Scraper-Secret') || url.searchParams.get('secret') || '';
+        if (!env.SCRAPER_SECRET || providedSecret !== env.SCRAPER_SECRET) {
+          return errorResponse('Unauthorized: invalid or missing scraper secret', 401);
+        }
+
+        const payload = await request.json() as IngestPayload;
+        ctx.waitUntil(ingestScrapeData(env, payload));
+        return jsonResponse({ message: 'Data ingested', timestamp: new Date().toISOString() });
       }
 
       // ---- 404 ----

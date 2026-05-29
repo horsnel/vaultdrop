@@ -1,17 +1,59 @@
-name: Trigger Scrape
+name: Scrape & Ingest
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */2 * * *'   # Every 2 hours
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Trigger Cloudflare Worker scrape
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scrape Reddit & APKMirror
+        id: scrape
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: |
-          curl -X POST "https://vaultdrop-worker.odehebuka48.workers.dev/scraper/trigger" || true
-          echo "Scrape triggered on Cloudflare Worker"
+          node scraper.mjs 2>&1 | tee scrape-output.txt
+          # Check if output file was created
+          if [ -f scrape-data.json ]; then
+            echo "has_data=true" >> $GITHUB_OUTPUT
+            echo "Scrape produced data:"
+            python3 -c "
+          import json
+          with open('scrape-data.json') as f:
+              d = json.load(f)
+          print(f'  Leaks: {len(d.get(\"leaks\", []))}')
+          print(f'  APK Alerts: {len(d.get(\"apk_alerts\", []))}')
+          print(f'  Advance Servers: {len(d.get(\"advance_servers\", []))}')
+          "
+          else
+            echo "has_data=false" >> $GITHUB_OUTPUT
+            echo "WARNING: No scrape data produced"
+          fi
+
+      - name: Ingest to Worker API
+        if: steps.scrape.outputs.has_data == 'true'
+        env:
+          SCRAPER_SECRET: ${{ secrets.SCRAPER_SECRET }}
+          WORKER_URL: ${{ vars.WORKER_URL || 'https://vaultdrop-worker.odehebuka48.workers.dev' }}
+        run: |
+          curl -s -X POST "${WORKER_URL}/scraper/ingest" \
+            -H "Content-Type: application/json" \
+            -H "X-Scraper-Secret: ${SCRAPER_SECRET}" \
+            -d @scrape-data.json || echo "Ingest failed — Worker may be down"
+
+      - name: Trigger Worker-side scrape (fallback)
+        run: |
+          curl -s -X POST "https://vaultdrop-worker.odehebuka48.workers.dev/scraper/trigger" || true
+          echo "Worker scrape triggered as fallback"

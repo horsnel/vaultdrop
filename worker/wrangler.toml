@@ -7,10 +7,13 @@ REPO_OWNER = "horsnel"
 REPO_NAME = "vaultdrop"
 DATA_BRANCH = "data"
 
-# GITHUB_TOKEN is set as a secret via: wrangler secret put GITHUB_TOKEN
-# No KV namespace — data is stored in GitHub data branch
+# Secrets (set via: wrangler secret put <NAME>)
+# - GITHUB_TOKEN:        GitHub PAT for repo read/write on data branch
+# - REDDIT_CLIENT_ID:    Reddit app client ID for OAuth2
+# - REDDIT_CLIENT_SECRET: Reddit app client secret for OAuth2
+# - SCRAPER_SECRET:      Shared secret for authenticating /scraper/ingest requests
 
-# Cron triggers for scheduled scraping
+# Cron triggers for scheduled scraping (every 15 minutes)
 [triggers]
 crons = ["*/15 * * * *"]
 

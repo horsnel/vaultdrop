@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'worker/**'
+      - 'scraper.mjs'
   workflow_dispatch:
 
 jobs:
@@ -35,5 +36,21 @@ jobs:
           command: deploy
           secrets: |
             GITHUB_TOKEN
+            REDDIT_CLIENT_ID
+            REDDIT_CLIENT_SECRET
+            SCRAPER_SECRET
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN_WORKER }}
+          GITHUB_TOKEN: ${{ secrets.WORKER_GITHUB_TOKEN }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          SCRAPER_SECRET: ${{ secrets.SCRAPER_SECRET }}
+
+      - name: Verify deployment
+        run: |
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://vaultdrop-worker.odehebuka48.workers.dev/health")
+          if [ "$STATUS" = "200" ]; then
+            echo "Worker deployed successfully and responding!"
+          else
+            echo "WARNING: Worker returned status $STATUS after deployment"
+          fi
